@@ -111,6 +111,131 @@ function saveCustomersFor(id, list) {
   fs.writeFileSync(customersFile(id), JSON.stringify(list, null, 2));
 }
 
+// ---- Bulk upload + auto-allocation pool ----
+//
+// Uploaded JSON/CSV contacts land in one shared pool, then get spread across
+// existing accounts automatically (8-12 per account, no account exceeding 12
+// total), so each number only handles a small, low-risk batch at a time.
+const POOL_FILE = path.join(DATA_ROOT, 'pool.json');
+
+function getPool() {
+  try {
+    return JSON.parse(fs.readFileSync(POOL_FILE, 'utf-8'));
+  } catch (err) {
+    return [];
+  }
+}
+function savePool(list) {
+  fs.mkdirSync(DATA_ROOT, { recursive: true });
+  fs.writeFileSync(POOL_FILE, JSON.stringify(list, null, 2));
+}
+
+function normalizeContact(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const name = String(entry.name || entry.Name || entry.NAME || '').trim();
+  const rawNumber = entry.number || entry.Number || entry.NUMBER || entry.phone || entry.Phone || entry.mobile || entry.Mobile || '';
+  const number = String(rawNumber).replace(/\D/g, '');
+  if (!name || number.length < 8) return null;
+  return { name, number };
+}
+
+function getAllExistingNumbers() {
+  const set = new Set();
+  for (const acc of loadAccountsList()) {
+    for (const c of getCustomers(acc.id)) set.add(c.number);
+  }
+  for (const c of getPool()) set.add(c.number);
+  return set;
+}
+
+// Pure function (no file I/O) so it can be unit tested directly: spreads
+// `pool` round-robin across `accountIds`, each account getting a random
+// 8-12 sized chunk per round, never exceeding `capPerAccount` total.
+function allocatePoolAcrossAccounts(pool, accountIds, existingCustomersByAccount, minChunk = 8, maxChunk = 12, capPerAccount = 12) {
+  const poolCopy = pool.slice();
+  const result = {};
+  for (const id of accountIds) {
+    result[id] = existingCustomersByAccount[id] ? existingCustomersByAccount[id].slice() : [];
+  }
+
+  let progress = true;
+  while (poolCopy.length > 0 && progress && accountIds.length > 0) {
+    progress = false;
+    for (const id of accountIds) {
+      if (poolCopy.length === 0) break;
+      const current = result[id];
+      const room = capPerAccount - current.length;
+      if (room <= 0) continue;
+      const desired = minChunk + Math.floor(Math.random() * (maxChunk - minChunk + 1));
+      const chunkSize = Math.min(room, desired, poolCopy.length);
+      if (chunkSize <= 0) continue;
+      const existingNumbers = new Set(current.map((c) => c.number));
+      let taken = 0;
+      while (taken < chunkSize && poolCopy.length > 0) {
+        const next = poolCopy.shift();
+        if (!existingNumbers.has(next.number)) {
+          current.push(next);
+          existingNumbers.add(next.number);
+        }
+        taken++;
+      }
+      progress = true;
+    }
+  }
+  return { allocated: result, remaining: poolCopy };
+}
+
+function autoAllocatePool() {
+  const accountsList = loadAccountsList();
+  const accountIds = accountsList.map((a) => a.id);
+  const pool = getPool();
+  const existingByAccount = {};
+  for (const id of accountIds) existingByAccount[id] = getCustomers(id);
+
+  const { allocated, remaining } = allocatePoolAcrossAccounts(pool, accountIds, existingByAccount);
+
+  for (const id of accountIds) saveCustomersFor(id, allocated[id]);
+  savePool(remaining);
+
+  const perAccount = accountsList.map((a) => ({ id: a.id, label: a.label, total: allocated[a.id].length }));
+  return { perAccount, remainingInPool: remaining.length };
+}
+
+// Pure function: given accounts (in the order selected) each with their own
+// customer list, take customers in order until `totalClients` is reached.
+function pickCustomersForMasterBroadcast(accountsWithCustomers, totalClients) {
+  const perAccountSelection = {};
+  let remaining = totalClients;
+  for (const acc of accountsWithCustomers) {
+    if (remaining <= 0) {
+      perAccountSelection[acc.id] = [];
+      continue;
+    }
+    const take = Math.min(remaining, acc.customers.length);
+    perAccountSelection[acc.id] = acc.customers.slice(0, take);
+    remaining -= take;
+  }
+  return perAccountSelection;
+}
+
+// Pure function: remove the customers that were just messaged from a list,
+// matched by number, leaving anything not included in this batch untouched.
+function removeSentCustomers(fullList, sentList) {
+  const sentNumbers = new Set(sentList.map((c) => c.number));
+  return fullList.filter((c) => !sentNumbers.has(c.number));
+}
+
+async function checkSessionValid(id) {
+  const state = runtime.get(id);
+  if (!state || !state.client || !state.isReady) return false;
+  try {
+    const waState = await state.client.getState();
+    return waState === 'CONNECTED';
+  } catch (err) {
+    return false;
+  }
+}
+
 // ---- Crash-loop protection (same fix as before, now per-account folder) ----
 //
 // Chromium writes a "SingletonLock" file into its profile folder while
@@ -282,6 +407,15 @@ app.get('/admin', requireAdminAuth, (req, res) => {
 app.get('/account/:id', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'account.html'));
 });
+app.get('/manager', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'manager-list.html'));
+});
+app.get('/manager/:id', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'manager.html'));
+});
+app.get('/master', requireAdminAuth, (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'master.html'));
+});
 
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -341,6 +475,63 @@ app.delete('/api/admin/accounts/:id', requireAdminAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
+// Bulk upload: accepts contacts already parsed to JSON on the client side
+// (works for both uploaded .json and .csv files — CSV parsing happens in
+// the browser before this is called). Adds valid, non-duplicate contacts to
+// the shared pool, then immediately auto-allocates across all accounts.
+app.post('/api/admin/upload-contacts', requireAdminAuth, (req, res) => {
+  const raw = req.body.contacts;
+  if (!Array.isArray(raw)) return res.status(400).json({ error: 'contacts must be an array' });
+
+  const existingNumbers = getAllExistingNumbers();
+  let added = 0;
+  let invalidSkipped = 0;
+  let duplicateSkipped = 0;
+  const pool = getPool();
+
+  for (const entry of raw) {
+    const normalized = normalizeContact(entry);
+    if (!normalized) {
+      invalidSkipped++;
+      continue;
+    }
+    if (existingNumbers.has(normalized.number)) {
+      duplicateSkipped++;
+      continue;
+    }
+    pool.push(normalized);
+    existingNumbers.add(normalized.number);
+    added++;
+  }
+  savePool(pool);
+
+  const allocation = autoAllocatePool();
+
+  res.json({
+    ok: true,
+    received: raw.length,
+    added,
+    invalidSkipped,
+    duplicateSkipped,
+    allocation
+  });
+});
+
+app.get('/api/admin/pool', requireAdminAuth, (req, res) => {
+  res.json({ remaining: getPool().length });
+});
+
+// Lightweight, ungated listing used by the Manager page — only exposes
+// label/connection status, nothing about customers or messages.
+app.get('/api/manager/accounts', (req, res) => {
+  const list = loadAccountsList();
+  const withStatus = list.map((a) => {
+    const state = runtime.get(a.id) || {};
+    return { id: a.id, label: a.label, isReady: !!state.isReady, statusMessage: state.statusMessage || 'Unknown' };
+  });
+  res.json(withStatus);
+});
+
 // ---- Per-account API (used by the /account/:id page) ----
 function requireAccount(req, res, next) {
   if (!runtime.has(req.params.id)) return res.status(404).json({ error: 'Account not found.' });
@@ -380,12 +571,19 @@ app.post('/api/accounts/:id/customers', requireAccount, (req, res) => {
   res.json({ ok: true });
 });
 
+app.get('/api/accounts/:id/session-check', requireAccount, async (req, res) => {
+  const valid = await checkSessionValid(req.params.id);
+  res.json({ valid });
+});
+
 app.get('/api/accounts/:id/log', requireAccount, (req, res) => {
   res.json(runtime.get(req.params.id).sendLog);
 });
 
 // Send the same message to every customer of this account, one at a time,
-// with a random delay between each send.
+// with a random delay between each send. Once the whole batch is done, this
+// account's customer list is cleared so the next upload/allocation doesn't
+// risk messaging the same people twice.
 app.post('/api/accounts/:id/send', requireAccount, async (req, res) => {
   const id = req.params.id;
   const state = runtime.get(id);
@@ -415,8 +613,94 @@ app.post('/api/accounts/:id/send', requireAccount, async (req, res) => {
     const delay = 4000 + Math.floor(Math.random() * 6000);
     await sleep(delay);
   }
+
+  // Broadcast batch finished — clear this account's list so a future
+  // upload/allocation round can't accidentally message these people again.
+  saveCustomersFor(id, []);
+});
+
+// ---- Master broadcast: send one message across multiple accounts at once ----
+let masterLog = { startedAt: null, perAccount: {} };
+
+app.get('/api/master/log', requireAdminAuth, (req, res) => {
+  res.json(masterLog);
+});
+
+app.post('/api/master/send', requireAdminAuth, async (req, res) => {
+  const { accountIds, totalClients, message } = req.body;
+
+  if (!Array.isArray(accountIds) || accountIds.length === 0) {
+    return res.status(400).json({ error: 'Select at least one account.' });
+  }
+  if (!message || !message.trim()) {
+    return res.status(400).json({ error: 'Message is required.' });
+  }
+  const total = parseInt(totalClients, 10);
+  if (!total || total <= 0) {
+    return res.status(400).json({ error: 'Enter a valid total number of clients.' });
+  }
+
+  // Session validity check: confirm each selected number is actually still
+  // connected before including it, rather than finding out mid-broadcast.
+  const validAccountIds = [];
+  const skippedAccounts = [];
+  for (const id of accountIds) {
+    if (!runtime.has(id)) {
+      skippedAccounts.push({ id, reason: 'Account not found.' });
+      continue;
+    }
+    const valid = await checkSessionValid(id);
+    if (!valid) {
+      skippedAccounts.push({ id, label: runtime.get(id).label, reason: 'WhatsApp session is not active.' });
+      continue;
+    }
+    validAccountIds.push(id);
+  }
+
+  const accountsWithCustomers = validAccountIds.map((id) => ({ id, customers: getCustomers(id) }));
+  const selection = pickCustomersForMasterBroadcast(accountsWithCustomers, total);
+  const totalQueued = Object.values(selection).reduce((sum, list) => sum + list.length, 0);
+
+  res.json({
+    ok: true,
+    queuedAccounts: validAccountIds.length,
+    skippedAccounts,
+    totalQueued
+  });
+
+  masterLog = { startedAt: new Date().toISOString(), perAccount: {} };
+  for (const id of validAccountIds) masterLog.perAccount[id] = { label: runtime.get(id).label, entries: [] };
+
+  await Promise.all(validAccountIds.map(async (id) => {
+    const state = runtime.get(id);
+    const customersToSend = selection[id] || [];
+    for (const customer of customersToSend) {
+      const number = String(customer.number).replace(/\D/g, '');
+      const chatId = `${number}@c.us`;
+      try {
+        const personalized = message.replace(/\{name\}/g, customer.name || '');
+        await state.client.sendMessage(chatId, personalized);
+        masterLog.perAccount[id].entries.push({ name: customer.name, number, status: 'sent', time: new Date().toISOString() });
+      } catch (err) {
+        masterLog.perAccount[id].entries.push({ name: customer.name, number, status: 'failed', error: err.message, time: new Date().toISOString() });
+      }
+      const delay = 4000 + Math.floor(Math.random() * 6000);
+      await sleep(delay);
+    }
+    // Remove only the customers actually included in this batch, so anyone
+    // left over (due to the totalClients cap) stays for next time.
+    const remaining = removeSentCustomers(getCustomers(id), customersToSend);
+    saveCustomersFor(id, remaining);
+  }));
 });
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
+module.exports = {
+  allocatePoolAcrossAccounts,
+  pickCustomersForMasterBroadcast,
+  removeSentCustomers,
+  normalizeContact
+};
