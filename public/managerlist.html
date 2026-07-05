@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Manager — Link WhatsApp</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div class="container">
+  <h1>🔗 Link WhatsApp</h1>
+  <div class="subtitle">Pick an account below and scan the QR code with that WhatsApp number. That's it — no other setup needed here.</div>
+
+  <div class="card">
+    <div id="accountList">Loading...</div>
+  </div>
+</div>
+
+<script>
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+}
+
+async function loadAccounts() {
+  const el = document.getElementById('accountList');
+  const res = await fetch('/api/manager/accounts');
+  const accounts = await res.json();
+  if (accounts.length === 0) {
+    el.innerHTML = '<div class="hint">No accounts have been set up yet. Ask your admin to add one first.</div>';
+    return;
+  }
+  el.innerHTML = accounts.map(a =>
+    '<div class="account-row">' +
+      '<div class="left">' +
+        '<div class="dot ' + (a.isReady ? 'ready' : 'waiting') + '"></div>' +
+        '<div><div>' + escapeHtml(a.label) + '</div><div class="meta">' + escapeHtml(a.statusMessage) + '</div></div>' +
+      '</div>' +
+      '<div class="actions"><a href="/manager/' + a.id + '"><button>Link</button></a></div>' +
+    '</div>'
+  ).join('');
+}
+
+setInterval(loadAccounts, 5000);
+loadAccounts();
+</script>
+</body>
+</html>
