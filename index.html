@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>WhatsApp Offer Broadcaster</title>
+<style>
+  :root {
+    --green: #25D366;
+    --dark-green: #128C7E;
+    --bg: #f0f2f5;
+    --card: #ffffff;
+    --text: #222;
+    --muted: #667;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px;
+  }
+  .container { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 22px; color: var(--dark-green); margin-bottom: 4px; }
+  .subtitle { color: var(--muted); margin-bottom: 24px; font-size: 14px; }
+  .card {
+    background: var(--card);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+  .status-row { display: flex; align-items: center; gap: 10px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #ccc; }
+  .dot.ready { background: var(--green); }
+  .dot.waiting { background: #f5a623; }
+  #qrBox { text-align: center; margin-top: 16px; }
+  #qrBox img { width: 220px; height: 220px; }
+  textarea {
+    width: 100%;
+    min-height: 120px;
+    padding: 12px;
+    border-radius: 8px;
+    border: 1px solid #ddd;
+    font-size: 14px;
+    font-family: inherit;
+    resize: vertical;
+  }
+  button {
+    background: var(--green);
+    color: white;
+    border: none;
+    padding: 12px 20px;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    margin-top: 12px;
+  }
+  button:disabled { background: #ccc; cursor: not-allowed; }
+  button.secondary { background: #eee; color: #333; }
+  .customer-list { font-size: 14px; color: var(--muted); }
+  .customer-row { padding: 6px 0; border-bottom: 1px solid #f0f0f0; display: flex; justify-content: space-between; }
+  .log { font-size: 13px; max-height: 180px; overflow-y: auto; }
+  .log .entry { padding: 4px 0; border-bottom: 1px solid #f5f5f5; }
+  .log .sent { color: var(--dark-green); }
+  .log .failed { color: #c0392b; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>📣 WhatsApp Offer Broadcaster</h1>
+  <div class="subtitle">Send one message to all your customers in a click.</div>
+
+  <div class="card">
+    <div class="status-row">
+      <div class="dot" id="statusDot"></div>
+      <div id="statusText">Checking status...</div>
+    </div>
+    <div id="qrBox"></div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">Your customers</h3>
+    <div class="customer-list" id="customerList">Loading...</div>
+    <div class="hint">Edit customers.json in the project and redeploy to update this list.</div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">Message</h3>
+    <textarea id="message" placeholder="e.g. Hi {name}! We have a special 20% off offer this weekend only. Reply to grab yours!"></textarea>
+    <div class="hint">Tip: use {name} in your message and it'll be replaced with each customer's name.</div>
+    <button id="sendBtn">Send to all customers</button>
+    <span id="sendStatus" style="margin-left:10px; font-size:14px;"></span>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">Send log</h3>
+    <div class="log" id="log">No messages sent yet.</div>
+  </div>
+</div>
+
+<script>
+async function refreshStatus() {
+  const res = await fetch('/api/status');
+  const data = await res.json();
+  const dot = document.getElementById('statusDot');
+  const text = document.getElementById('statusText');
+  text.textContent = data.statusMessage;
+  dot.className = 'dot ' + (data.isReady ? 'ready' : (data.hasQr ? 'waiting' : ''));
+
+  const qrBox = document.getElementById('qrBox');
+  if (data.hasQr && !data.isReady) {
+    const qrRes = await fetch('/api/qr');
+    const qrData = await qrRes.json();
+    if (qrData.qr) {
+      qrBox.innerHTML = '<img src="' + qrData.qr + '" alt="Scan with WhatsApp" /><div class="hint">Open WhatsApp on your phone → Settings → Linked Devices → Link a Device</div>';
+    }
+  } else {
+    qrBox.innerHTML = '';
+  }
+}
+
+async function loadCustomers() {
+  const res = await fetch('/api/customers');
+  const customers = await res.json();
+  const el = document.getElementById('customerList');
+  if (customers.length === 0) {
+    el.textContent = 'No customers configured yet.';
+    return;
+  }
+  el.innerHTML = customers.map(c =>
+    '<div class="customer-row"><span>' + c.name + '</span><span>' + c.number + '</span></div>'
+  ).join('');
+}
+
+async function loadLog() {
+  const res = await fetch('/api/log');
+  const log = await res.json();
+  const el = document.getElementById('log');
+  if (log.length === 0) {
+    el.textContent = 'No messages sent yet.';
+    return;
+  }
+  el.innerHTML = log.map(entry =>
+    '<div class="entry ' + entry.status + '">' + entry.name + ' (' + entry.number + ') — ' + entry.status + '</div>'
+  ).join('');
+}
+
+document.getElementById('sendBtn').addEventListener('click', async () => {
+  const message = document.getElementById('message').value;
+  const statusSpan = document.getElementById('sendStatus');
+  if (!message.trim()) {
+    statusSpan.textContent = 'Write a message first.';
+    return;
+  }
+  const btn = document.getElementById('sendBtn');
+  btn.disabled = true;
+  statusSpan.textContent = 'Sending...';
+  try {
+    const res = await fetch('/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      statusSpan.textContent = data.error || 'Something went wrong.';
+    } else {
+      statusSpan.textContent = 'Sending to ' + data.queued + ' customers in the background...';
+    }
+  } catch (err) {
+    statusSpan.textContent = 'Network error.';
+  }
+  btn.disabled = false;
+});
+
+setInterval(refreshStatus, 3000);
+setInterval(loadLog, 5000);
+refreshStatus();
+loadCustomers();
+loadLog();
+</script>
+</body>
+</html>
