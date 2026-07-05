@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Admin Panel — WhatsApp Broadcaster</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div class="container">
+  <a class="back-link" href="/">← Back</a>
+  <h1>⚙️ Admin Panel</h1>
+  <div class="subtitle">Add or remove linked WhatsApp accounts.</div>
+
+  <div class="banner">
+    This page has no login by default. Anyone with this URL can add/remove
+    accounts. Keep the link private, or set an <code>ADMIN_PASSWORD</code>
+    environment variable in Railway to require a key (append
+    <code>?key=YOUR_PASSWORD</code> to the URL).
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">Accounts</h3>
+    <div id="accountList">Loading...</div>
+
+    <div class="new-account-row">
+      <input type="text" id="newLabel" placeholder="Label, e.g. Shop Number 1" />
+      <button id="addAccountBtn">Add account</button>
+    </div>
+    <div id="accountError" class="error-text"></div>
+  </div>
+</div>
+
+<script>
+function getKey() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get('key');
+}
+function withKey(url) {
+  const key = getKey();
+  if (!key) return url;
+  const sep = url.includes('?') ? '&' : '?';
+  return url + sep + 'key=' + encodeURIComponent(key);
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+}
+
+async function loadAccounts() {
+  const el = document.getElementById('accountList');
+  const res = await fetch(withKey('/api/admin/accounts'));
+  if (res.status === 401) {
+    el.innerHTML = '<div class="hint">Unauthorized — add the correct ?key= to the URL.</div>';
+    return;
+  }
+  const accounts = await res.json();
+  if (accounts.length === 0) {
+    el.innerHTML = '<div class="hint">No accounts yet. Add one below.</div>';
+    return;
+  }
+  el.innerHTML = accounts.map(a =>
+    '<div class="account-row">' +
+      '<div class="left">' +
+        '<div class="dot ' + (a.isReady ? 'ready' : 'waiting') + '"></div>' +
+        '<div>' +
+          '<div>' + escapeHtml(a.label) + '</div>' +
+          '<div class="meta">' + escapeHtml(a.statusMessage) + ' · ' + a.customerCount + ' customers</div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="actions">' +
+        '<a href="/account/' + a.id + '"><button class="secondary">Open</button></a>' +
+        '<button class="danger" data-id="' + a.id + '">Remove</button>' +
+      '</div>' +
+    '</div>'
+  ).join('');
+
+  el.querySelectorAll('.danger').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      if (!confirm('Remove this account? This deletes its WhatsApp session and customer list permanently.')) return;
+      btn.disabled = true;
+      await fetch(withKey('/api/admin/accounts/' + btn.getAttribute('data-id')), { method: 'DELETE' });
+      loadAccounts();
+    });
+  });
+}
+
+document.getElementById('addAccountBtn').addEventListener('click', async () => {
+  const input = document.getElementById('newLabel');
+  const errorEl = document.getElementById('accountError');
+  const label = input.value.trim();
+  errorEl.textContent = '';
+  if (!label) {
+    errorEl.textContent = 'Enter a label for this account.';
+    return;
+  }
+  const res = await fetch(withKey('/api/admin/accounts'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ label })
+  });
+  if (!res.ok) {
+    errorEl.textContent = 'Could not add account.';
+    return;
+  }
+  const data = await res.json();
+  input.value = '';
+  await loadAccounts();
+  window.location.href = '/account/' + data.id;
+});
+
+setInterval(loadAccounts, 5000);
+loadAccounts();
+</script>
+</body>
+</html>
