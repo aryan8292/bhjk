@@ -61,7 +61,32 @@
   button:disabled { background: #ccc; cursor: not-allowed; }
   button.secondary { background: #eee; color: #333; }
   .customer-list { font-size: 14px; color: var(--muted); }
-  .customer-row { padding: 6px 0; border-bottom: 1px solid #f0f0f0; display: flex; justify-content: space-between; }
+  .customer-row { padding: 6px 0; border-bottom: 1px solid #f0f0f0; display: flex; justify-content: space-between; align-items: center; }
+  .customer-row .info { display: flex; gap: 10px; }
+  .customer-row .remove-btn {
+    background: none;
+    border: none;
+    color: #c0392b;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 2px 8px;
+    margin-top: 0;
+  }
+  .add-contact-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 14px;
+  }
+  .add-contact-row input {
+    flex: 1;
+    padding: 10px;
+    border-radius: 8px;
+    border: 1px solid #ddd;
+    font-size: 14px;
+  }
+  .add-contact-row button { margin-top: 0; padding: 10px 16px; }
+  .error-text { color: #c0392b; font-size: 13px; margin-top: 8px; min-height: 16px; }
   .log { font-size: 13px; max-height: 180px; overflow-y: auto; }
   .log .entry { padding: 4px 0; border-bottom: 1px solid #f5f5f5; }
   .log .sent { color: var(--dark-green); }
@@ -85,7 +110,14 @@
   <div class="card">
     <h3 style="margin-top:0;">Your customers</h3>
     <div class="customer-list" id="customerList">Loading...</div>
-    <div class="hint">Edit customers.json in the project and redeploy to update this list.</div>
+
+    <div class="add-contact-row">
+      <input type="text" id="newName" placeholder="Name" />
+      <input type="text" id="newNumber" placeholder="Number e.g. 919876543210" />
+      <button id="addContactBtn" class="secondary">Add</button>
+    </div>
+    <div class="hint">Enter the number with country code, digits only, no + or spaces.</div>
+    <div id="contactError" class="error-text"></div>
   </div>
 
   <div class="card">
@@ -123,18 +155,78 @@ async function refreshStatus() {
   }
 }
 
+let currentCustomers = [];
+
 async function loadCustomers() {
   const res = await fetch('/api/customers');
-  const customers = await res.json();
+  currentCustomers = await res.json();
+  renderCustomers();
+}
+
+function renderCustomers() {
   const el = document.getElementById('customerList');
-  if (customers.length === 0) {
-    el.textContent = 'No customers configured yet.';
+  if (currentCustomers.length === 0) {
+    el.innerHTML = '<div class="hint">No customers yet — add one below.</div>';
     return;
   }
-  el.innerHTML = customers.map(c =>
-    '<div class="customer-row"><span>' + c.name + '</span><span>' + c.number + '</span></div>'
+  el.innerHTML = currentCustomers.map((c, i) =>
+    '<div class="customer-row">' +
+      '<span class="info"><span>' + escapeHtml(c.name) + '</span><span>' + escapeHtml(c.number) + '</span></span>' +
+      '<button class="remove-btn" data-index="' + i + '">Remove</button>' +
+    '</div>'
   ).join('');
+
+  el.querySelectorAll('.remove-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const idx = parseInt(btn.getAttribute('data-index'), 10);
+      currentCustomers.splice(idx, 1);
+      await saveCustomers();
+    });
+  });
 }
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+}
+
+async function saveCustomers() {
+  await fetch('/api/customers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ customers: currentCustomers })
+  });
+  renderCustomers();
+}
+
+document.getElementById('addContactBtn').addEventListener('click', async () => {
+  const nameInput = document.getElementById('newName');
+  const numberInput = document.getElementById('newNumber');
+  const errorEl = document.getElementById('contactError');
+  const name = nameInput.value.trim();
+  const number = numberInput.value.replace(/\D/g, '');
+
+  errorEl.textContent = '';
+
+  if (!name) {
+    errorEl.textContent = 'Enter a name.';
+    return;
+  }
+  if (!number || number.length < 8) {
+    errorEl.textContent = 'Enter a valid number with country code (digits only).';
+    return;
+  }
+  if (currentCustomers.some((c) => c.number === number)) {
+    errorEl.textContent = 'That number is already in your list.';
+    return;
+  }
+
+  currentCustomers.push({ name, number });
+  await saveCustomers();
+  nameInput.value = '';
+  numberInput.value = '';
+});
 
 async function loadLog() {
   const res = await fetch('/api/log');
@@ -175,6 +267,10 @@ document.getElementById('sendBtn').addEventListener('click', async () => {
     statusSpan.textContent = 'Network error.';
   }
   btn.disabled = false;
+});
+
+document.getElementById('newNumber').addEventListener('keypress', (e) => {
+  if (e.key === 'Enter') document.getElementById('addContactBtn').click();
 });
 
 setInterval(refreshStatus, 3000);
