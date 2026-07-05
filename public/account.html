@@ -29,7 +29,7 @@
       <input type="text" id="newNumber" placeholder="Number e.g. 919876543210" />
       <button id="addContactBtn" class="secondary">Add</button>
     </div>
-    <div class="hint">Enter the number with country code, digits only, no + or spaces.</div>
+    <div class="hint">Enter the number with country code, digits only, no + or spaces. A plain 10-digit number is assumed to be Indian and "91" is added automatically.</div>
     <div id="contactError" class="error-text"></div>
   </div>
 
@@ -123,7 +123,8 @@ document.getElementById('addContactBtn').addEventListener('click', async () => {
   const numberInput = document.getElementById('newNumber');
   const errorEl = document.getElementById('contactError');
   const name = nameInput.value.trim();
-  const number = numberInput.value.replace(/\D/g, '');
+  let number = numberInput.value.replace(/\D/g, '');
+  if (number.length === 10) number = '91' + number; // bare 10-digit numbers assumed Indian
 
   errorEl.textContent = '';
   if (!name) {
