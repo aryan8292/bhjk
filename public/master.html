@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Master Broadcast</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div class="container">
+  <a class="back-link" href="/">← Back</a>
+  <h1>📢 Master Broadcast</h1>
+  <div class="subtitle">For big sale alerts — send one message across several accounts at once.</div>
+
+  <div class="banner">
+    Before sending, each selected account's WhatsApp session is checked and
+    any that aren't actively connected are automatically skipped (shown in
+    the result below) rather than failing silently.
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">1. Select accounts</h3>
+    <div id="accountList">Loading...</div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">2. Total clients to message</h3>
+    <input type="text" id="totalClients" placeholder="e.g. 50" style="width:100%;" />
+    <div class="hint">Customers are taken in order from the selected accounts (combined) until this total is reached.</div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">3. Message</h3>
+    <textarea id="message" placeholder="e.g. 🎉 Big sale alert! {name}, get 30% off everything this weekend only!"></textarea>
+    <div class="hint">Use {name} to personalize per customer.</div>
+    <button id="sendBtn">Send Master Broadcast</button>
+    <span id="sendStatus" style="margin-left:10px; font-size:14px;"></span>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">Result</h3>
+    <div class="log" id="resultLog">Nothing sent yet.</div>
+  </div>
+</div>
+
+<script>
+function getKey() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get('key');
+}
+function withKey(url) {
+  const key = getKey();
+  if (!key) return url;
+  const sep = url.includes('?') ? '&' : '?';
+  return url + sep + 'key=' + encodeURIComponent(key);
+}
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+}
+
+async function loadAccounts() {
+  const el = document.getElementById('accountList');
+  const res = await fetch(withKey('/api/admin/accounts'));
+  if (res.status === 401) {
+    el.innerHTML = '<div class="hint">Unauthorized — add the correct ?key= to the URL.</div>';
+    return;
+  }
+  const accounts = await res.json();
+  if (accounts.length === 0) {
+    el.innerHTML = '<div class="hint">No accounts yet.</div>';
+    return;
+  }
+  el.innerHTML = accounts.map(a =>
+    '<div class="account-row">' +
+      '<div class="left">' +
+        '<label style="display:flex; align-items:center; gap:10px; cursor:pointer;">' +
+          '<input type="checkbox" class="acc-checkbox" value="' + a.id + '" ' + (a.isReady ? 'checked' : '') + ' />' +
+          '<div class="dot ' + (a.isReady ? 'ready' : 'waiting') + '"></div>' +
+          '<div><div>' + escapeHtml(a.label) + '</div><div class="meta">' + a.customerCount + ' customers · ' + escapeHtml(a.statusMessage) + '</div></div>' +
+        '</label>' +
+      '</div>' +
+    '</div>'
+  ).join('');
+}
+
+document.getElementById('sendBtn').addEventListener('click', async () => {
+  const selected = Array.from(document.querySelectorAll('.acc-checkbox:checked')).map(cb => cb.value);
+  const totalClients = document.getElementById('totalClients').value;
+  const message = document.getElementById('message').value;
+  const statusSpan = document.getElementById('sendStatus');
+
+  if (selected.length === 0) { statusSpan.textContent = 'Select at least one account.'; return; }
+  if (!totalClients || parseInt(totalClients, 10) <= 0) { statusSpan.textContent = 'Enter a valid total clients number.'; return; }
+  if (!message.trim()) { statusSpan.textContent = 'Write a message first.'; return; }
+
+  const btn = document.getElementById('sendBtn');
+  btn.disabled = true;
+  statusSpan.textContent = 'Checking sessions and sending...';
+
+  try {
+    const res = await fetch(withKey('/api/master/send'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountIds: selected, totalClients: parseInt(totalClients, 10), message })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      statusSpan.textContent = data.error || 'Something went wrong.';
+    } else {
+      let msg = 'Sending to ' + data.totalQueued + ' customers across ' + data.queuedAccounts + ' account(s).';
+      if (data.skippedAccounts && data.skippedAccounts.length > 0) {
+        msg += ' Skipped ' + data.skippedAccounts.length + ' account(s) — see result below.';
+      }
+      statusSpan.textContent = msg;
+      if (data.skippedAccounts && data.skippedAccounts.length > 0) {
+        document.getElementById('resultLog').innerHTML = data.skippedAccounts.map(s =>
+          '<div class="entry failed">' + escapeHtml(s.label || s.id) + ': ' + escapeHtml(s.reason) + '</div>'
+        ).join('');
+      }
+    }
+  } catch (err) {
+    statusSpan.textContent = 'Network error.';
+  }
+  btn.disabled = false;
+  loadAccounts();
+});
+
+async function loadLog() {
+  const res = await fetch(withKey('/api/master/log'));
+  if (!res.ok) return;
+  const log = await res.json();
+  const el = document.getElementById('resultLog');
+  const accountIds = Object.keys(log.perAccount || {});
+  if (accountIds.length === 0) return;
+  el.innerHTML = accountIds.map(id => {
+    const acc = log.perAccount[id];
+    const entries = acc.entries.map(e =>
+      '<div class="entry ' + e.status + '">' + escapeHtml(e.name) + ' (' + escapeHtml(e.number) + ') — ' + e.status + '</div>'
+    ).join('');
+    return '<div style="margin-bottom:10px;"><strong>' + escapeHtml(acc.label) + '</strong>' + entries + '</div>';
+  }).join('');
+}
+
+setInterval(loadAccounts, 8000);
+setInterval(loadLog, 4000);
+loadAccounts();
+loadLog();
+</script>
+</body>
+</html>
