@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Link WhatsApp</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div class="container">
+  <a class="back-link" href="/manager">← All accounts</a>
+  <h1 id="pageTitle">🔗 Link WhatsApp</h1>
+  <div class="subtitle">Scan the QR code below with this WhatsApp number's phone. Nothing else to do here.</div>
+
+  <div class="card">
+    <div class="status-row">
+      <div class="dot" id="statusDot"></div>
+      <div id="statusText">Checking status...</div>
+    </div>
+    <div id="qrBox"></div>
+    <div id="readyBox" style="display:none; text-align:center; padding:20px 0;">
+      <div style="font-size:40px;">✅</div>
+      <div style="margin-top:8px; font-weight:600;">This number is connected. You're all set!</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const accountId = window.location.pathname.split('/').filter(Boolean)[1];
+const API = '/api/accounts/' + accountId;
+
+async function refreshStatus() {
+  const res = await fetch(API + '/status');
+  if (!res.ok) return;
+  const data = await res.json();
+  document.getElementById('pageTitle').textContent = '🔗 ' + (data.label || 'Link WhatsApp');
+  const dot = document.getElementById('statusDot');
+  const text = document.getElementById('statusText');
+  text.textContent = data.statusMessage;
+  dot.className = 'dot ' + (data.isReady ? 'ready' : (data.hasQr ? 'waiting' : ''));
+
+  const qrBox = document.getElementById('qrBox');
+  const readyBox = document.getElementById('readyBox');
+
+  if (data.isReady) {
+    qrBox.innerHTML = '';
+    readyBox.style.display = 'block';
+    return;
+  }
+  readyBox.style.display = 'none';
+
+  if (data.hasQr) {
+    const qrRes = await fetch(API + '/qr');
+    const qrData = await qrRes.json();
+    if (qrData.qr) {
+      qrBox.innerHTML = '<img src="' + qrData.qr + '" alt="Scan with WhatsApp" /><div class="hint">Open WhatsApp on your phone → Settings → Linked Devices → Link a Device</div>';
+    }
+  } else {
+    qrBox.innerHTML = '';
+  }
+}
+
+setInterval(refreshStatus, 3000);
+refreshStatus();
+</script>
+</body>
+</html>
