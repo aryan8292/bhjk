@@ -12,6 +12,11 @@
   <h1>⚙️ Admin Panel</h1>
   <div class="subtitle">Add or remove linked WhatsApp accounts.</div>
 
+  <div class="card">
+    <a href="/master">📢 Master Broadcast</a> &nbsp;·&nbsp;
+    <a href="/manager">🔗 Manager Link Page</a>
+  </div>
+
   <div class="banner">
     This page has no login by default. Anyone with this URL can add/remove
     accounts. Keep the link private, or set an <code>ADMIN_PASSWORD</code>
@@ -28,6 +33,21 @@
       <button id="addAccountBtn">Add account</button>
     </div>
     <div id="accountError" class="error-text"></div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">Bulk upload customers (JSON or CSV)</h3>
+    <div class="hint">
+      JSON: an array of objects like <code>{"name":"Rahul","number":"919876543210"}</code>.<br/>
+      CSV: a header row with "name" and "number" columns (or just two columns, name then number).
+    </div>
+    <input type="file" id="contactFileInput" accept=".json,.csv" style="margin-top:10px;" />
+    <div class="hint">
+      Uploaded contacts are automatically split into batches of 8–12 and
+      assigned across your existing accounts — no extra steps needed.
+      Duplicate numbers (already assigned anywhere) are skipped automatically.
+    </div>
+    <div id="uploadResult" class="hint" style="margin-top:10px;"></div>
   </div>
 </div>
 
@@ -113,6 +133,81 @@ document.getElementById('addAccountBtn').addEventListener('click', async () => {
 
 setInterval(loadAccounts, 5000);
 loadAccounts();
+
+// ---- Bulk upload handling ----
+function parseCsv(text) {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return [];
+
+  const header = lines[0].split(',').map((h) => h.trim().toLowerCase());
+  const nameCols = ['name', 'customer', 'customer name'];
+  const numberCols = ['number', 'phone', 'mobile', 'whatsapp', 'contact'];
+  const foundNameIdx = header.findIndex((h) => nameCols.includes(h));
+  const foundNumberIdx = header.findIndex((h) => numberCols.includes(h));
+
+  let startIdx = 0, nameIdx = 0, numberIdx = 1;
+  if (foundNameIdx !== -1 && foundNumberIdx !== -1) {
+    nameIdx = foundNameIdx;
+    numberIdx = foundNumberIdx;
+    startIdx = 1;
+  }
+
+  const contacts = [];
+  for (let i = startIdx; i < lines.length; i++) {
+    const cols = lines[i].split(',');
+    contacts.push({
+      name: (cols[nameIdx] || '').trim(),
+      number: (cols[numberIdx] || '').trim()
+    });
+  }
+  return contacts;
+}
+
+async function handleFileUpload(file) {
+  const resultEl = document.getElementById('uploadResult');
+  const text = await file.text();
+  let contacts = [];
+
+  if (file.name.toLowerCase().endsWith('.json')) {
+    try {
+      const data = JSON.parse(text);
+      contacts = Array.isArray(data) ? data : [];
+    } catch (err) {
+      resultEl.textContent = 'Invalid JSON file.';
+      return;
+    }
+  } else {
+    contacts = parseCsv(text);
+  }
+
+  if (contacts.length === 0) {
+    resultEl.textContent = 'No contacts found in that file.';
+    return;
+  }
+
+  resultEl.textContent = 'Uploading and allocating ' + contacts.length + ' contacts...';
+  const res = await fetch(withKey('/api/admin/upload-contacts'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contacts })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    resultEl.textContent = data.error || 'Upload failed.';
+    return;
+  }
+  resultEl.innerHTML =
+    'Received ' + data.received + ', added ' + data.added +
+    ' (skipped ' + data.duplicateSkipped + ' duplicates, ' + data.invalidSkipped + ' invalid).<br>' +
+    'Remaining unallocated (no room in any account): ' + data.allocation.remainingInPool + '.';
+  loadAccounts();
+}
+
+document.getElementById('contactFileInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (file) handleFileUpload(file);
+  e.target.value = '';
+});
 </script>
 </body>
 </html>
