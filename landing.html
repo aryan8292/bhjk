@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>WhatsApp Broadcaster</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div class="container">
+  <h1>📣 WhatsApp Broadcaster</h1>
+  <div class="subtitle">Pick your account below to link WhatsApp and send messages.</div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">Your accounts</h3>
+    <div id="accountList">Loading...</div>
+  </div>
+
+  <div class="card">
+    <a href="/admin">Go to Admin Panel →</a>
+    <div class="hint">Manage accounts (add, remove) from the admin panel.</div>
+  </div>
+</div>
+
+<script>
+async function loadAccounts() {
+  const el = document.getElementById('accountList');
+  try {
+    const res = await fetch('/api/admin/accounts');
+    if (!res.ok) {
+      el.innerHTML = '<div class="hint">Could not load accounts.</div>';
+      return;
+    }
+    const accounts = await res.json();
+    if (accounts.length === 0) {
+      el.innerHTML = '<div class="hint">No accounts yet — add one from the <a href="/admin">admin panel</a>.</div>';
+      return;
+    }
+    el.innerHTML = accounts.map(a =>
+      '<div class="account-row">' +
+        '<div class="left">' +
+          '<div class="dot ' + (a.isReady ? 'ready' : 'waiting') + '"></div>' +
+          '<div><div>' + escapeHtml(a.label) + '</div><div class="meta">' + a.customerCount + ' customers</div></div>' +
+        '</div>' +
+        '<div class="actions"><a href="/account/' + a.id + '"><button>Open</button></a></div>' +
+      '</div>'
+    ).join('');
+  } catch (err) {
+    el.innerHTML = '<div class="hint">Could not load accounts.</div>';
+  }
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+}
+
+loadAccounts();
+</script>
+</body>
+</html>
