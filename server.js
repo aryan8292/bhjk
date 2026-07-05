@@ -130,11 +130,19 @@ function savePool(list) {
   fs.writeFileSync(POOL_FILE, JSON.stringify(list, null, 2));
 }
 
+// A bare 10-digit number (no country code) is assumed to be an Indian
+// mobile number, so we prepend "91" automatically. Numbers that already
+// include a country code (11+ digits) are left as-is.
+function applyIndianCountryCode(digits) {
+  if (digits.length === 10) return '91' + digits;
+  return digits;
+}
+
 function normalizeContact(entry) {
   if (!entry || typeof entry !== 'object') return null;
   const name = String(entry.name || entry.Name || entry.NAME || '').trim();
   const rawNumber = entry.number || entry.Number || entry.NUMBER || entry.phone || entry.Phone || entry.mobile || entry.Mobile || '';
-  const number = String(rawNumber).replace(/\D/g, '');
+  const number = applyIndianCountryCode(String(rawNumber).replace(/\D/g, ''));
   if (!name || number.length < 8) return null;
   return { name, number };
 }
@@ -560,7 +568,7 @@ app.post('/api/accounts/:id/customers', requireAccount, (req, res) => {
     if (!entry || typeof entry.name !== 'string' || !entry.name.trim()) {
       return res.status(400).json({ error: 'Every contact needs a name.' });
     }
-    const digits = String(entry.number || '').replace(/\D/g, '');
+    const digits = applyIndianCountryCode(String(entry.number || '').replace(/\D/g, ''));
     if (digits.length < 8) {
       return res.status(400).json({ error: `Invalid number for ${entry.name}.` });
     }
@@ -702,5 +710,6 @@ module.exports = {
   allocatePoolAcrossAccounts,
   pickCustomersForMasterBroadcast,
   removeSentCustomers,
-  normalizeContact
+  normalizeContact,
+  applyIndianCountryCode
 };
