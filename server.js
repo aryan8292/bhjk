@@ -203,6 +203,18 @@ app.get('/api/customers', (req, res) => {
 app.post('/api/customers', (req, res) => {
   const list = req.body.customers;
   if (!Array.isArray(list)) return res.status(400).json({ error: 'customers must be an array' });
+
+  for (const entry of list) {
+    if (!entry || typeof entry.name !== 'string' || !entry.name.trim()) {
+      return res.status(400).json({ error: 'Every contact needs a name.' });
+    }
+    const digits = String(entry.number || '').replace(/\D/g, '');
+    if (digits.length < 8) {
+      return res.status(400).json({ error: `Invalid number for ${entry.name}.` });
+    }
+    entry.number = digits;
+  }
+
   saveCustomers(list);
   res.json({ ok: true });
 });
