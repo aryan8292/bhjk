@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>WhatsApp Account — Broadcaster</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div class="container">
+  <a class="back-link" href="/">← All accounts</a>
+  <h1 id="pageTitle">📣 WhatsApp Account</h1>
+  <div class="subtitle">Link this WhatsApp number and send offers to its customers.</div>
+
+  <div class="card">
+    <div class="status-row">
+      <div class="dot" id="statusDot"></div>
+      <div id="statusText">Checking status...</div>
+    </div>
+    <div id="qrBox"></div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">Customers</h3>
+    <div class="customer-list" id="customerList">Loading...</div>
+
+    <div class="add-contact-row">
+      <input type="text" id="newName" placeholder="Name" />
+      <input type="text" id="newNumber" placeholder="Number e.g. 919876543210" />
+      <button id="addContactBtn" class="secondary">Add</button>
+    </div>
+    <div class="hint">Enter the number with country code, digits only, no + or spaces.</div>
+    <div id="contactError" class="error-text"></div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">Message</h3>
+    <textarea id="message" placeholder="e.g. Hi {name}! We have a special 20% off offer this weekend only. Reply to grab yours!"></textarea>
+    <div class="hint">Tip: use {name} in your message and it'll be replaced with each customer's name.</div>
+    <button id="sendBtn">Send to all customers</button>
+    <span id="sendStatus" style="margin-left:10px; font-size:14px;"></span>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">Send log</h3>
+    <div class="log" id="log">No messages sent yet.</div>
+  </div>
+</div>
+
+<script>
+const accountId = window.location.pathname.split('/').filter(Boolean)[1];
+const API = '/api/accounts/' + accountId;
+let currentCustomers = [];
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+}
+
+async function refreshStatus() {
+  const res = await fetch(API + '/status');
+  if (!res.ok) return;
+  const data = await res.json();
+  document.getElementById('pageTitle').textContent = '📣 ' + (data.label || 'WhatsApp Account');
+  const dot = document.getElementById('statusDot');
+  const text = document.getElementById('statusText');
+  text.textContent = data.statusMessage;
+  dot.className = 'dot ' + (data.isReady ? 'ready' : (data.hasQr ? 'waiting' : ''));
+
+  const qrBox = document.getElementById('qrBox');
+  if (data.hasQr && !data.isReady) {
+    const qrRes = await fetch(API + '/qr');
+    const qrData = await qrRes.json();
+    if (qrData.qr) {
+      qrBox.innerHTML = '<img src="' + qrData.qr + '" alt="Scan with WhatsApp" /><div class="hint">Open WhatsApp on your phone → Settings → Linked Devices → Link a Device</div>';
+    }
+  } else {
+    qrBox.innerHTML = '';
+  }
+}
+
+async function loadCustomers() {
+  const res = await fetch(API + '/customers');
+  if (!res.ok) return;
+  currentCustomers = await res.json();
+  renderCustomers();
+}
+
+function renderCustomers() {
+  const el = document.getElementById('customerList');
+  if (currentCustomers.length === 0) {
+    el.innerHTML = '<div class="hint">No customers yet — add one below.</div>';
+    return;
+  }
+  el.innerHTML = currentCustomers.map((c, i) =>
+    '<div class="customer-row">' +
+      '<span class="info"><span>' + escapeHtml(c.name) + '</span><span>' + escapeHtml(c.number) + '</span></span>' +
+      '<button class="remove-btn" data-index="' + i + '">Remove</button>' +
+    '</div>'
+  ).join('');
+
+  el.querySelectorAll('.remove-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const idx = parseInt(btn.getAttribute('data-index'), 10);
+      currentCustomers.splice(idx, 1);
+      await saveCustomers();
+    });
+  });
+}
+
+async function saveCustomers() {
+  await fetch(API + '/customers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ customers: currentCustomers })
+  });
+  renderCustomers();
+}
+
+document.getElementById('addContactBtn').addEventListener('click', async () => {
+  const nameInput = document.getElementById('newName');
+  const numberInput = document.getElementById('newNumber');
+  const errorEl = document.getElementById('contactError');
+  const name = nameInput.value.trim();
+  const number = numberInput.value.replace(/\D/g, '');
+
+  errorEl.textContent = '';
+  if (!name) {
+    errorEl.textContent = 'Enter a name.';
+    return;
+  }
+  if (!number || number.length < 8) {
+    errorEl.textContent = 'Enter a valid number with country code (digits only).';
+    return;
+  }
+  if (currentCustomers.some((c) => c.number === number)) {
+    errorEl.textContent = 'That number is already in your list.';
+    return;
+  }
+
+  currentCustomers.push({ name, number });
+  await saveCustomers();
+  nameInput.value = '';
+  numberInput.value = '';
+});
+
+document.getElementById('newNumber').addEventListener('keypress', (e) => {
+  if (e.key === 'Enter') document.getElementById('addContactBtn').click();
+});
+
+async function loadLog() {
+  const res = await fetch(API + '/log');
+  if (!res.ok) return;
+  const log = await res.json();
+  const el = document.getElementById('log');
+  if (log.length === 0) {
+    el.textContent = 'No messages sent yet.';
+    return;
+  }
+  el.innerHTML = log.map(entry =>
+    '<div class="entry ' + entry.status + '">' + escapeHtml(entry.name) + ' (' + escapeHtml(entry.number) + ') — ' + entry.status + '</div>'
+  ).join('');
+}
+
+document.getElementById('sendBtn').addEventListener('click', async () => {
+  const message = document.getElementById('message').value;
+  const statusSpan = document.getElementById('sendStatus');
+  if (!message.trim()) {
+    statusSpan.textContent = 'Write a message first.';
+    return;
+  }
+  const btn = document.getElementById('sendBtn');
+  btn.disabled = true;
+  statusSpan.textContent = 'Sending...';
+  try {
+    const res = await fetch(API + '/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      statusSpan.textContent = data.error || 'Something went wrong.';
+    } else {
+      statusSpan.textContent = 'Sending to ' + data.queued + ' customers in the background...';
+    }
+  } catch (err) {
+    statusSpan.textContent = 'Network error.';
+  }
+  btn.disabled = false;
+});
+
+setInterval(refreshStatus, 3000);
+setInterval(loadLog, 5000);
+refreshStatus();
+loadCustomers();
+loadLog();
+</script>
+</body>
+</html>
