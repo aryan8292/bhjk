@@ -6,47 +6,119 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 
 const app = express();
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
-
-// Explicit fallback so "/" always serves the UI even if static resolution
-// has issues (e.g. public/ missing in a deploy).
-app.get('/', (req, res) => {
-  const indexPath = path.join(__dirname, 'public', 'index.html');
-  if (fs.existsSync(indexPath)) {
-    res.sendFile(indexPath);
-  } else {
-    res.status(500).send(
-      'public/index.html not found on the server. ' +
-      'This usually means the public/ folder was not included in your deploy — ' +
-      'check that it is committed to your git repo and not excluded by .gitignore.'
-    );
-  }
-});
 
 const PORT = process.env.PORT || 3000;
-const AUTH_PATH = process.env.WWEBJS_AUTH_PATH || path.join(__dirname, '.wwebjs_auth');
-const CUSTOMERS_FILE = path.join(__dirname, 'customers.json');
 
-let latestQr = null;
-let isReady = false;
-let statusMessage = 'Starting up...';
-let sendLog = [];
-let client = null;
-let startingUp = false;
+// All persistent data (WhatsApp sessions AND customer lists) lives under this
+// one root, which should be a Railway Volume mount so it survives redeploys.
+// Structure:
+//   DATA_ROOT/accounts.json          <- list of {id, label, createdAt}
+//   DATA_ROOT/<accountId>/session/   <- that account's WhatsApp login session
+//   DATA_ROOT/<accountId>/customers.json
+const DATA_ROOT = process.env.WWEBJS_AUTH_PATH || path.join(__dirname, '.data');
+const ACCOUNTS_FILE = path.join(DATA_ROOT, 'accounts.json');
 
-// ---- Crash-loop protection ----
+// Optional admin password. If ADMIN_PASSWORD is not set, the admin page and
+// its API are completely open (as requested). Set the env var to require
+// ?key=... on admin routes.
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || null;
+
+function accountDir(id) {
+  return path.join(DATA_ROOT, id);
+}
+function customersFile(id) {
+  return path.join(accountDir(id), 'customers.json');
+}
+
+// runtime (in-memory) state per account: id -> { label, client, isReady, latestQr, statusMessage, sendLog, startingUp }
+const runtime = new Map();
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---- One-time migration from the old single-account layout ----
 //
-// Chromium writes a "SingletonLock" file (plus SingletonSocket/SingletonCookie)
-// into its profile folder while running, and removes it on clean exit. If the
-// container is killed/crashes, that lock file is left behind. Because our
-// profile folder lives on a persistent Railway Volume, the *next* container
-// start sees that stale lock and refuses to launch Chromium — which crashed
-// the whole process, which made Railway restart it, which hit the same lock
-// again... an infinite crash loop.
-//
-// Fix: wipe any stale lock files before every launch attempt, and never let a
-// launch failure kill the Node process — retry with a delay instead.
+// The previous version of this app stored the WhatsApp session directly at
+// DATA_ROOT/session/... and the customer list at <project>/customers.json.
+// If we detect that old layout and no accounts.json yet, fold it into a
+// "default" account so existing logins/customers aren't lost.
+function migrateLegacyDataIfNeeded() {
+  fs.mkdirSync(DATA_ROOT, { recursive: true });
+  if (fs.existsSync(ACCOUNTS_FILE)) return;
 
+  const legacySession = path.join(DATA_ROOT, 'session');
+  const legacyCustomers = path.join(__dirname, 'customers.json');
+  const hasLegacyData = fs.existsSync(legacySession) || fs.existsSync(legacyCustomers);
+
+  if (!hasLegacyData) {
+    // Fresh install, nothing to migrate — start with an empty account list.
+    saveAccountsList([]);
+    return;
+  }
+
+  console.log('Running one-time migration to multi-account data layout...');
+  const defaultId = 'default';
+  const defaultDir = accountDir(defaultId);
+  fs.mkdirSync(defaultDir, { recursive: true });
+
+  const newSessionPath = path.join(defaultDir, 'session');
+  if (fs.existsSync(legacySession) && !fs.existsSync(newSessionPath)) {
+    try {
+      fs.renameSync(legacySession, newSessionPath);
+      console.log('Migrated existing WhatsApp session into the "default" account.');
+    } catch (err) {
+      console.error('Could not migrate legacy session:', err.message);
+    }
+  }
+
+  const newCustomersPath = customersFile(defaultId);
+  if (fs.existsSync(legacyCustomers) && !fs.existsSync(newCustomersPath)) {
+    try {
+      fs.copyFileSync(legacyCustomers, newCustomersPath);
+      console.log('Migrated existing customer list into the "default" account.');
+    } catch (err) {
+      console.error('Could not migrate legacy customers.json:', err.message);
+    }
+  }
+  if (!fs.existsSync(newCustomersPath)) {
+    fs.writeFileSync(newCustomersPath, '[]');
+  }
+
+  saveAccountsList([{ id: defaultId, label: 'Main Account', createdAt: new Date().toISOString() }]);
+}
+
+function loadAccountsList() {
+  try {
+    return JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf-8'));
+  } catch (err) {
+    return [];
+  }
+}
+function saveAccountsList(list) {
+  fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(list, null, 2));
+}
+
+function getCustomers(id) {
+  try {
+    return JSON.parse(fs.readFileSync(customersFile(id), 'utf-8'));
+  } catch (err) {
+    return [];
+  }
+}
+function saveCustomersFor(id, list) {
+  fs.mkdirSync(accountDir(id), { recursive: true });
+  fs.writeFileSync(customersFile(id), JSON.stringify(list, null, 2));
+}
+
+// ---- Crash-loop protection (same fix as before, now per-account folder) ----
+//
+// Chromium writes a "SingletonLock" file into its profile folder while
+// running and removes it on clean exit. If the container is killed/crashes,
+// that lock is left behind. Because profile folders live on a persistent
+// volume, the next start sees the stale lock and refuses to launch Chromium,
+// crashing again — a loop. Fix: wipe stale locks before every launch attempt,
+// and never let a launch failure kill the whole Node process.
 const LOCK_FILENAMES = new Set(['SingletonLock', 'SingletonSocket', 'SingletonCookie']);
 
 function removeStaleLockFiles(dir) {
@@ -55,7 +127,6 @@ function removeStaleLockFiles(dir) {
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
   } catch (err) {
-    console.error('Could not read directory while cleaning locks:', dir, err.message);
     return;
   }
   for (const entry of entries) {
@@ -73,9 +144,22 @@ function removeStaleLockFiles(dir) {
   }
 }
 
-function createClient() {
+function initRuntime(id, label) {
+  runtime.set(id, {
+    label,
+    client: null,
+    isReady: false,
+    latestQr: null,
+    statusMessage: 'Starting up...',
+    sendLog: [],
+    startingUp: false
+  });
+}
+
+function createClientFor(id) {
+  const state = runtime.get(id);
   const c = new Client({
-    authStrategy: new LocalAuth({ dataPath: AUTH_PATH }),
+    authStrategy: new LocalAuth({ dataPath: accountDir(id) }),
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
@@ -92,58 +176,63 @@ function createClient() {
   });
 
   c.on('qr', async (qr) => {
-    latestQr = await qrcode.toDataURL(qr);
-    isReady = false;
-    statusMessage = 'Scan the QR code with WhatsApp (Linked Devices)';
-    console.log('QR code generated. Visit /qr to scan.');
+    state.latestQr = await qrcode.toDataURL(qr);
+    state.isReady = false;
+    state.statusMessage = 'Scan the QR code with WhatsApp (Linked Devices)';
+    console.log(`[${id}] QR code generated.`);
   });
 
   c.on('ready', () => {
-    isReady = true;
-    latestQr = null;
-    statusMessage = 'Connected. Ready to send messages.';
-    console.log('WhatsApp client is ready.');
+    state.isReady = true;
+    state.latestQr = null;
+    state.statusMessage = 'Connected. Ready to send messages.';
+    console.log(`[${id}] WhatsApp client is ready.`);
   });
 
   c.on('disconnected', (reason) => {
-    isReady = false;
-    statusMessage = `Disconnected: ${reason}. Reconnecting...`;
-    console.log('Client disconnected:', reason);
-    scheduleStart(5000);
+    state.isReady = false;
+    state.statusMessage = `Disconnected: ${reason}. Reconnecting...`;
+    console.log(`[${id}] Client disconnected:`, reason);
+    scheduleStart(id, 5000);
   });
 
   c.on('auth_failure', (msg) => {
-    isReady = false;
-    statusMessage = `Auth failure: ${msg}`;
-    console.error('Auth failure:', msg);
+    state.isReady = false;
+    state.statusMessage = `Auth failure: ${msg}`;
+    console.error(`[${id}] Auth failure:`, msg);
   });
 
   return c;
 }
 
-async function startClient() {
-  if (startingUp) return;
-  startingUp = true;
-  statusMessage = 'Starting WhatsApp client...';
+async function startAccountClient(id) {
+  const state = runtime.get(id);
+  if (!state || state.startingUp) return;
+  state.startingUp = true;
+  state.statusMessage = 'Starting WhatsApp client...';
 
-  removeStaleLockFiles(AUTH_PATH);
+  removeStaleLockFiles(accountDir(id));
 
   try {
-    client = createClient();
-    await client.initialize();
+    state.client = createClientFor(id);
+    await state.client.initialize();
   } catch (err) {
-    console.error('Failed to initialize WhatsApp client:', err.message);
-    statusMessage = 'Failed to start WhatsApp client, retrying shortly...';
-    scheduleStart(10000);
+    console.error(`[${id}] Failed to initialize WhatsApp client:`, err.message);
+    state.statusMessage = 'Failed to start WhatsApp client, retrying shortly...';
+    scheduleStart(id, 10000);
   } finally {
-    startingUp = false;
+    state.startingUp = false;
   }
 }
 
-function scheduleStart(delayMs) {
+function scheduleStart(id, delayMs) {
   setTimeout(() => {
-    startClient();
+    if (runtime.has(id)) startAccountClient(id);
   }, delayMs);
+}
+
+function generateAccountId() {
+  return 'acc_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
 
 // Catch anything that slips through so the process never hard-crashes.
@@ -156,51 +245,123 @@ process.on('uncaughtException', (err) => {
 
 async function shutdown() {
   console.log('Shutting down gracefully...');
-  try {
-    if (client) await client.destroy();
-  } catch (err) {
-    console.error('Error during shutdown:', err.message);
+  for (const [id, state] of runtime.entries()) {
+    try {
+      if (state.client) await state.client.destroy();
+    } catch (err) {
+      console.error(`[${id}] Error during shutdown:`, err.message);
+    }
   }
   process.exit(0);
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-startClient();
+// ---- Boot ----
+migrateLegacyDataIfNeeded();
+for (const acc of loadAccountsList()) {
+  initRuntime(acc.id, acc.label);
+  startAccountClient(acc.id);
+}
 
-function getCustomers() {
-  try {
-    const raw = fs.readFileSync(CUSTOMERS_FILE, 'utf-8');
-    return JSON.parse(raw);
-  } catch (err) {
-    return [];
+// ---- Admin auth (optional, off by default) ----
+function requireAdminAuth(req, res, next) {
+  if (!ADMIN_PASSWORD) return next();
+  const provided = req.query.key || req.headers['x-admin-key'];
+  if (provided === ADMIN_PASSWORD) return next();
+  res.status(401).send('Unauthorized. Add ?key=YOUR_ADMIN_PASSWORD to the URL, or set the x-admin-key header.');
+}
+
+// ---- Pages ----
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'landing.html'));
+});
+app.get('/admin', requireAdminAuth, (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
+});
+app.get('/account/:id', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'account.html'));
+});
+
+app.use(express.static(path.join(__dirname, 'public')));
+
+// ---- Admin API ----
+app.get('/api/admin/accounts', requireAdminAuth, (req, res) => {
+  const list = loadAccountsList();
+  const withStatus = list.map((a) => {
+    const state = runtime.get(a.id) || {};
+    return {
+      id: a.id,
+      label: a.label,
+      createdAt: a.createdAt,
+      isReady: !!state.isReady,
+      statusMessage: state.statusMessage || 'Unknown',
+      customerCount: getCustomers(a.id).length
+    };
+  });
+  res.json(withStatus);
+});
+
+app.post('/api/admin/accounts', requireAdminAuth, (req, res) => {
+  const label = (req.body.label || '').trim() || 'New Account';
+  const id = generateAccountId();
+  const list = loadAccountsList();
+  list.push({ id, label, createdAt: new Date().toISOString() });
+  saveAccountsList(list);
+  initRuntime(id, label);
+  saveCustomersFor(id, []);
+  startAccountClient(id);
+  res.json({ ok: true, id, label });
+});
+
+app.delete('/api/admin/accounts/:id', requireAdminAuth, async (req, res) => {
+  const id = req.params.id;
+  const list = loadAccountsList();
+  const idx = list.findIndex((a) => a.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'Account not found.' });
+
+  const state = runtime.get(id);
+  if (state && state.client) {
+    try {
+      await state.client.destroy();
+    } catch (err) {
+      console.error(`[${id}] Error destroying client:`, err.message);
+    }
   }
-}
+  runtime.delete(id);
+  list.splice(idx, 1);
+  saveAccountsList(list);
 
-function saveCustomers(list) {
-  fs.writeFileSync(CUSTOMERS_FILE, JSON.stringify(list, null, 2));
-}
+  try {
+    fs.rmSync(accountDir(id), { recursive: true, force: true });
+  } catch (err) {
+    console.error(`[${id}] Error removing account data:`, err.message);
+  }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// ---- API routes ----
-
-app.get('/api/status', (req, res) => {
-  res.json({ isReady, statusMessage, hasQr: !!latestQr });
+  res.json({ ok: true });
 });
 
-app.get('/api/qr', (req, res) => {
-  if (latestQr) return res.json({ qr: latestQr });
-  res.json({ qr: null });
+// ---- Per-account API (used by the /account/:id page) ----
+function requireAccount(req, res, next) {
+  if (!runtime.has(req.params.id)) return res.status(404).json({ error: 'Account not found.' });
+  next();
+}
+
+app.get('/api/accounts/:id/status', requireAccount, (req, res) => {
+  const s = runtime.get(req.params.id);
+  res.json({ isReady: s.isReady, statusMessage: s.statusMessage, hasQr: !!s.latestQr, label: s.label });
 });
 
-app.get('/api/customers', (req, res) => {
-  res.json(getCustomers());
+app.get('/api/accounts/:id/qr', requireAccount, (req, res) => {
+  const s = runtime.get(req.params.id);
+  res.json({ qr: s.latestQr || null });
 });
 
-app.post('/api/customers', (req, res) => {
+app.get('/api/accounts/:id/customers', requireAccount, (req, res) => {
+  res.json(getCustomers(req.params.id));
+});
+
+app.post('/api/accounts/:id/customers', requireAccount, (req, res) => {
   const list = req.body.customers;
   if (!Array.isArray(list)) return res.status(400).json({ error: 'customers must be an array' });
 
@@ -215,42 +376,42 @@ app.post('/api/customers', (req, res) => {
     entry.number = digits;
   }
 
-  saveCustomers(list);
+  saveCustomersFor(req.params.id, list);
   res.json({ ok: true });
 });
 
-app.get('/api/log', (req, res) => {
-  res.json(sendLog);
+app.get('/api/accounts/:id/log', requireAccount, (req, res) => {
+  res.json(runtime.get(req.params.id).sendLog);
 });
 
-// Send the same message to every customer, one at a time, with a random
-// delay between each send so it behaves like a human sending messages
-// rather than a bot blasting them all instantly.
-app.post('/api/send', async (req, res) => {
+// Send the same message to every customer of this account, one at a time,
+// with a random delay between each send.
+app.post('/api/accounts/:id/send', requireAccount, async (req, res) => {
+  const id = req.params.id;
+  const state = runtime.get(id);
   const { message } = req.body;
-  if (!isReady || !client) return res.status(400).json({ error: 'WhatsApp is not connected yet. Scan the QR code first.' });
+
+  if (!state.isReady || !state.client) return res.status(400).json({ error: 'WhatsApp is not connected yet. Scan the QR code first.' });
   if (!message || !message.trim()) return res.status(400).json({ error: 'Message is required.' });
 
-  const customers = getCustomers();
+  const customers = getCustomers(id);
   if (customers.length === 0) return res.status(400).json({ error: 'No customers configured.' });
 
-  // Respond immediately, then send in the background so the click doesn't hang.
   res.json({ ok: true, queued: customers.length });
 
-  sendLog = [];
+  state.sendLog = [];
   for (const customer of customers) {
     const number = String(customer.number).replace(/\D/g, '');
     const chatId = `${number}@c.us`;
     try {
       const personalized = message.replace(/\{name\}/g, customer.name || '');
-      await client.sendMessage(chatId, personalized);
-      sendLog.push({ name: customer.name, number, status: 'sent', time: new Date().toISOString() });
-      console.log(`Sent to ${customer.name} (${number})`);
+      await state.client.sendMessage(chatId, personalized);
+      state.sendLog.push({ name: customer.name, number, status: 'sent', time: new Date().toISOString() });
+      console.log(`[${id}] Sent to ${customer.name} (${number})`);
     } catch (err) {
-      sendLog.push({ name: customer.name, number, status: 'failed', error: err.message, time: new Date().toISOString() });
-      console.error(`Failed to send to ${customer.name} (${number}):`, err.message);
+      state.sendLog.push({ name: customer.name, number, status: 'failed', error: err.message, time: new Date().toISOString() });
+      console.error(`[${id}] Failed to send to ${customer.name} (${number}):`, err.message);
     }
-    // Random delay between 4-10 seconds between each message.
     const delay = 4000 + Math.floor(Math.random() * 6000);
     await sleep(delay);
   }
