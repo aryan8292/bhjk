@@ -8,6 +8,21 @@ const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Explicit fallback so "/" always serves the UI even if static resolution
+// has issues (e.g. public/ missing in a deploy).
+app.get('/', (req, res) => {
+  const indexPath = path.join(__dirname, 'public', 'index.html');
+  if (fs.existsSync(indexPath)) {
+    res.sendFile(indexPath);
+  } else {
+    res.status(500).send(
+      'public/index.html not found on the server. ' +
+      'This usually means the public/ folder was not included in your deploy — ' +
+      'check that it is committed to your git repo and not excluded by .gitignore.'
+    );
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 const AUTH_PATH = process.env.WWEBJS_AUTH_PATH || path.join(__dirname, '.wwebjs_auth');
 const CUSTOMERS_FILE = path.join(__dirname, 'customers.json');
