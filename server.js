@@ -31,50 +31,142 @@ let latestQr = null;
 let isReady = false;
 let statusMessage = 'Starting up...';
 let sendLog = [];
+let client = null;
+let startingUp = false;
 
-const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: AUTH_PATH }),
-  puppeteer: {
-    headless: true,
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--disable-gpu'
-    ]
+// ---- Crash-loop protection ----
+//
+// Chromium writes a "SingletonLock" file (plus SingletonSocket/SingletonCookie)
+// into its profile folder while running, and removes it on clean exit. If the
+// container is killed/crashes, that lock file is left behind. Because our
+// profile folder lives on a persistent Railway Volume, the *next* container
+// start sees that stale lock and refuses to launch Chromium — which crashed
+// the whole process, which made Railway restart it, which hit the same lock
+// again... an infinite crash loop.
+//
+// Fix: wipe any stale lock files before every launch attempt, and never let a
+// launch failure kill the Node process — retry with a delay instead.
+
+const LOCK_FILENAMES = new Set(['SingletonLock', 'SingletonSocket', 'SingletonCookie']);
+
+function removeStaleLockFiles(dir) {
+  if (!fs.existsSync(dir)) return;
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    console.error('Could not read directory while cleaning locks:', dir, err.message);
+    return;
   }
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      removeStaleLockFiles(fullPath);
+    } else if (LOCK_FILENAMES.has(entry.name)) {
+      try {
+        fs.unlinkSync(fullPath);
+        console.log('Removed stale Chromium lock file:', fullPath);
+      } catch (err) {
+        console.error('Could not remove lock file:', fullPath, err.message);
+      }
+    }
+  }
+}
+
+function createClient() {
+  const c = new Client({
+    authStrategy: new LocalAuth({ dataPath: AUTH_PATH }),
+    puppeteer: {
+      headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu'
+      ]
+    }
+  });
+
+  c.on('qr', async (qr) => {
+    latestQr = await qrcode.toDataURL(qr);
+    isReady = false;
+    statusMessage = 'Scan the QR code with WhatsApp (Linked Devices)';
+    console.log('QR code generated. Visit /qr to scan.');
+  });
+
+  c.on('ready', () => {
+    isReady = true;
+    latestQr = null;
+    statusMessage = 'Connected. Ready to send messages.';
+    console.log('WhatsApp client is ready.');
+  });
+
+  c.on('disconnected', (reason) => {
+    isReady = false;
+    statusMessage = `Disconnected: ${reason}. Reconnecting...`;
+    console.log('Client disconnected:', reason);
+    scheduleStart(5000);
+  });
+
+  c.on('auth_failure', (msg) => {
+    isReady = false;
+    statusMessage = `Auth failure: ${msg}`;
+    console.error('Auth failure:', msg);
+  });
+
+  return c;
+}
+
+async function startClient() {
+  if (startingUp) return;
+  startingUp = true;
+  statusMessage = 'Starting WhatsApp client...';
+
+  removeStaleLockFiles(AUTH_PATH);
+
+  try {
+    client = createClient();
+    await client.initialize();
+  } catch (err) {
+    console.error('Failed to initialize WhatsApp client:', err.message);
+    statusMessage = 'Failed to start WhatsApp client, retrying shortly...';
+    scheduleStart(10000);
+  } finally {
+    startingUp = false;
+  }
+}
+
+function scheduleStart(delayMs) {
+  setTimeout(() => {
+    startClient();
+  }, delayMs);
+}
+
+// Catch anything that slips through so the process never hard-crashes.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection (ignored to keep server alive):', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception (ignored to keep server alive):', err);
 });
 
-client.on('qr', async (qr) => {
-  latestQr = await qrcode.toDataURL(qr);
-  isReady = false;
-  statusMessage = 'Scan the QR code with WhatsApp (Linked Devices)';
-  console.log('QR code generated. Visit /qr to scan.');
-});
+async function shutdown() {
+  console.log('Shutting down gracefully...');
+  try {
+    if (client) await client.destroy();
+  } catch (err) {
+    console.error('Error during shutdown:', err.message);
+  }
+  process.exit(0);
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
-client.on('ready', () => {
-  isReady = true;
-  latestQr = null;
-  statusMessage = 'Connected. Ready to send messages.';
-  console.log('WhatsApp client is ready.');
-});
-
-client.on('disconnected', (reason) => {
-  isReady = false;
-  statusMessage = `Disconnected: ${reason}. Restart the app to reconnect.`;
-  console.log('Client disconnected:', reason);
-});
-
-client.on('auth_failure', (msg) => {
-  isReady = false;
-  statusMessage = `Auth failure: ${msg}`;
-});
-
-client.initialize();
+startClient();
 
 function getCustomers() {
   try {
@@ -124,7 +216,7 @@ app.get('/api/log', (req, res) => {
 // rather than a bot blasting them all instantly.
 app.post('/api/send', async (req, res) => {
   const { message } = req.body;
-  if (!isReady) return res.status(400).json({ error: 'WhatsApp is not connected yet. Scan the QR code first.' });
+  if (!isReady || !client) return res.status(400).json({ error: 'WhatsApp is not connected yet. Scan the QR code first.' });
   if (!message || !message.trim()) return res.status(400).json({ error: 'Message is required.' });
 
   const customers = getCustomers();
